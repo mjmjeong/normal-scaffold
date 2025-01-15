@@ -14,6 +14,24 @@ from einops import repeat
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+from utils.general_utils import build_rotation
+from utils.graphics_utils import normal_from_depth_image
+        
+def get_render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
+#def get_render_normal(viewpoint_cam, depth):
+    # depth: (H, W), bg_color: (3), alpha: (H, W)
+    # normal_ref: (3, H, W)
+    intrinsic_matrix, extrinsic_matrix = viewpoint_cam.get_calib_matrix_nerf(scale=scale)
+    st = max(int(scale/2)-1,0)
+    if offset is not None:
+        offset = offset[st::scale,st::scale]
+    normal_ref = normal_from_depth_image(depth[st::scale,st::scale], 
+                                            intrinsic_matrix.to(depth.device), 
+                                            extrinsic_matrix.to(depth.device), offset)
+
+    normal_ref = normal_ref.permute(2,0,1)
+    return normal_ref
+
 
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
     ## view frustum filtering for acceleration    
@@ -110,7 +128,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, color, opacity, scaling, rot
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, out_depth=False, return_normal=False, radius=0):
     """
     Render the scene. 
     
@@ -122,7 +140,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
         xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    
+
+    if out_depth:
+        # distance from 3D Gaussians to the camera.
+        depth = (xyz-viewpoint_camera.camera_center).norm(dim=1, keepdim=True).repeat([1,3])
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
@@ -131,7 +152,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             screenspace_points.retain_grad()
         except:
             pass
-
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -149,13 +169,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         sh_degree=1,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug
+        debug=pipe.debug,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
+    out= rasterizer(
         means3D = xyz,
         means2D = screenspace_points,
         shs = None,
@@ -164,10 +184,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scaling,
         rotations = rot,
         cov3D_precomp = None)
+        
+    rendered_image, radii = out[0], out[1]
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
-        return {"render": rendered_image,
+        return_dict = {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
@@ -176,11 +198,59 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "scaling": scaling,
                 }
     else:
-        return {"render": rendered_image,
+        return_dict = {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
                 }
+    
+    if out_depth:
+        # Rasterize visible Gaussians to image, obtain predicted depth of Scaffold-GS
+        out = rasterizer(
+            means3D = xyz,
+            means2D = screenspace_points,
+            shs = None,
+            colors_precomp = depth,
+                opacities = opacity,
+            scales = scaling,
+            rotations = rot,
+            cov3D_precomp = None)
+        rendered_depth_hand = out[0]
+        return_dict.update({'est_depth': rendered_depth_hand})
+        return_dict['depth_normal'] = get_render_normal(viewpoint_camera, rendered_depth_hand[0]) 
+        
+    if return_normal:
+        # Get the predicted normal of the Scaffold-GS, code get from Gaussian-pro
+        rotations_mat = build_rotation(rot)
+        scales = scaling
+        min_scales = torch.argmin(scales, dim=1)
+        indices = torch.arange(min_scales.shape[0])
+        normal = rotations_mat[indices, :, min_scales]
+
+        view_dir = xyz - viewpoint_camera.camera_center
+        normal = (
+            normal * ((((view_dir * normal).sum(dim=-1) < 0) * 1 - 0.5) * 2)[..., None]
+        )
+
+        R_w2c = torch.tensor(viewpoint_camera.R.T).cuda().to(torch.float32)
+        normal = (R_w2c @ normal.transpose(0, 1)).transpose(0, 1)
+
+        out = rasterizer(
+            means3D=xyz,
+            means2D=screenspace_points,
+            shs=None,
+            colors_precomp=normal,
+            opacities=opacity,
+            scales=scales,
+            rotations=rot,
+            cov3D_precomp=None,
+        )
+        render_normal = out[0]
+        render_normal = torch.nn.functional.normalize(render_normal, dim=0)
+
+        return_dict.update({'render_normal': render_normal})
+            
+    return return_dict
 
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
