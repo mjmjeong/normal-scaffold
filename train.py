@@ -19,7 +19,7 @@ os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in res
 
 os.system('echo $CUDA_VISIBLE_DEVICES')
 
-
+import matplotlib.pyplot as plt
 import torch
 import torchvision
 import json
@@ -30,6 +30,7 @@ import shutil, pathlib
 from pathlib import Path
 from PIL import Image
 import torchvision.transforms.functional as tf
+import torch.nn.functional as F
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
@@ -133,19 +134,60 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
-        
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, out_depth=False, return_normal=False)
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
-
+        
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-
         ssim_loss = (1.0 - ssim(image, gt_image))
-        scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
-        loss.backward()
+        # additional regularization
+        ######################################################
+        # 0) self-regularization loss (geometry)
+        scaling_reg = scaling.prod(dim=1).mean() # Scaffold-GS
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + args.lambda_all_scale * scaling_reg
+
+        # 1) flattness loss
+        if visibility_filter.sum() > 0:
+            scale = scaling[visibility_filter]
+            sorted_scale, _ = torch.sort(scale, dim=-1)
+            min_scale_loss = sorted_scale[..., 0]
+            loss += args.lambda_min_scale * min_scale_loss.mean()
+
+        # 2) opacity loss (0 or 1)
+        tgt_opacity = opacity[opacity>0]
+        opacity_loss = -1 * (tgt_opacity * torch.log(tgt_opacity+1e-10) + (1-tgt_opacity) * torch.log(1-tgt_opacity))
+        loss += args.lambda_opacity * opacity_loss.mean()
+
+        # 3) observation: area / 2d spectral entropy
+        sorted_scale_all, _ = torch.sort(scaling, dim=-1)
+        area = sorted_scale_all[..., -1] * sorted_scale_all[..., -2]
+        prob_2d = sorted_scale[..., 1:] / sorted_scale[..., 1:].sum(-1, keepdim=True)
+        spectral_energy_2d = (-1 * (prob_2d * torch.log(prob_2d)).sum(-1) ).mean()
+        loss += args.lambda_spectral_2d * (-1 * spectral_energy_2d)
+
+        # observation: condition number 
+        condition_number =  sorted_scale[..., -1] / sorted_scale[..., 0] #max/min
+        condition_number_mid =  sorted_scale[..., 1] / sorted_scale[..., 0] #mid/min
+
+        # observation: spectral entropy
+        prob = sorted_scale_all / sorted_scale_all.sum(-1, keepdim=True)
+        spectral_energy = (-1 * (prob * torch.log(prob)).sum(-1)).mean()
         
+        logging_dict = {}
+        logging_dict['scaling_reg'] = scaling_reg.item()
+        logging_dict['flattness (mean)'] = min_scale_loss.mean().item()
+        logging_dict['spectral_energy'] = spectral_energy.item()
+        logging_dict['spectral_energy_2d'] = spectral_energy_2d.item()
+        logging_dict['area_2d'] = area.mean().item()
+
+        # add coding
+        #logging_dict['axis_swapping_100'] = 0.
+        #logging_dict['axis_swapping_500'] = 0.
+        #logging_dict['axis_swapping_1000'] = 0.
+        # spectral-gs / variance of minimum axis optimization / uncertainty (flattness) / ratio 
+
+        loss.backward()        
         iter_end.record()
 
         with torch.no_grad():
@@ -159,7 +201,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, logging_dict)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -208,16 +250,24 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, logging_dict=None):
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
-
+    
+    if logging_dict is not None:
+        for k,v in logging_dict.items():
+            tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/{k}', v, iteration)
 
     if wandb is not None:
-        wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
-    
+        if logging_dict is not None:
+            logging_dict['train_l1_loss'] = Ll1
+            logging_dict['train_total_loss'] = loss
+            wandb.log(logging_dict)
+        else:
+            wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
+        
     # Report test and samples of training set
     if iteration in testing_iterations:
         scene.gaussians.eval()
@@ -493,10 +543,10 @@ if __name__ == "__main__":
 
     
 
-    try:
-        saveRuntimeCode(os.path.join(args.model_path, 'backup'))
-    except:
-        logger.info(f'save code failed~')
+    #try:
+    #    saveRuntimeCode(os.path.join(args.model_path, 'backup'))
+    #except:
+    logger.info(f'save code failed~')
         
     dataset = args.source_path.split('/')[-1]
     exp_name = args.model_path.split('/')[-2]
