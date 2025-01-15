@@ -43,6 +43,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    normal: np.array
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -110,10 +111,19 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
+        try:
+            if "DTU" in images_folder:
+                normal_path = os.path.join(Path(images_folder).parent , "normals", "00" + os.path.basename(extr.name))
+            else:
+                normal_path = os.path.join(Path(images_folder).parent , "normals", os.path.basename(extr.name))
+            normal_name = os.path.basename(normal_path).split(".")[0]
+            normal = Image.open(normal_path)
+        except:
+            normal = None
         # print(f'image: {image.size}')
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height, normal=normal)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -126,7 +136,10 @@ def fetchPly(path):
         colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     except:
         colors = np.random.rand(positions.shape[0], positions.shape[1])
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    try:
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    except:
+        normals = np.random.rand(positions.shape[0], positions.shape[1])
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):

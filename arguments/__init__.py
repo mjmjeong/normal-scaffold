@@ -76,6 +76,9 @@ class ModelParams(ParamGroup):
         self.add_cov_dist = False
         self.add_color_dist = False
         
+        # fewshot
+        self.fewshot_num = -1
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

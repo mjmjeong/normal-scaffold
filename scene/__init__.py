@@ -70,6 +70,7 @@ class Scene:
                 json.dump(json_cams, file)
 
         if shuffle:
+            random.seed(1)
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
@@ -94,13 +95,26 @@ class Scene:
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
+        if args.fewshot_num == -1:
+            self.fewshot_idx = None
+        else:
+            total_camera_idx = list(range(len(scene_info.train_cameras)))
+            random.seed(1)
+            self.fewshot_idx = random.choices(total_camera_idx, k=args.fewshot_num)
+
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         self.gaussians.save_mlp_checkpoints(point_cloud_path)
 
     def getTrainCameras(self, scale=1.0):
-        return self.train_cameras[scale]
-
+        if self.fewshot_idx is None:
+            return self.train_cameras[scale]
+        else:
+            train_cameras = self.train_cameras[scale]
+            out_cameras = [train_cameras[i] for i in self.fewshot_idx]
+#            print("train cam for fewshot", [cam.uid for cam in out_cameras])
+            return out_cameras
+    
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]

@@ -11,6 +11,7 @@
 
 from scene.cameras import Camera
 import numpy as np
+import torch.nn.functional as F
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 
@@ -41,6 +42,14 @@ def loadCam(args, id, cam_info, resolution_scale):
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
 
     gt_image = resized_image_rgb[:3, ...]
+    
+    
+    resized_normal_rgb = PILtoTorch(cam_info.normal)
+    gt_normal = resized_normal_rgb[:3, ...]
+
+    # size check for nearest neighbor
+    if gt_normal.size(-1) != gt_image.size(-1) or gt_normal.size(-2) != gt_image.size(-2):
+        gt_normal = F.interpolate(gt_normal.unsqueeze(0), size=(gt_image.size(-2),gt_image.size(-1)), mode='nearest')[0]
     loaded_mask = None
 
     # print(f'gt_image: {gt_image.shape}')
@@ -49,8 +58,12 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+                  image_height=cam_info.height, image_width=cam_info.width,
+                  image_path=cam_info.image_path, image_name=cam_info.image_name, uid=id, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  normal=gt_normal, 
+                  data_device=args.data_device,
+)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
