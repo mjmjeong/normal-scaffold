@@ -48,6 +48,14 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
+def show_normal(img_path, tensor_CHW):
+    tensor_HWC = tensor_CHW.detach().cpu().permute(1, 2, 0).numpy() 
+    normal_rgb = ((tensor_HWC + 1) * 0.5) * 255
+    normal_rgb = np.clip(normal_rgb, a_min=0, a_max=255)
+    normal_rgb = normal_rgb.astype(np.uint8)
+
+    plt.imsave(img_path, normal_rgb)
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -85,7 +93,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
-    scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
+    if len(args.checkpoint_iterations):
+        scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False, load_iteration=args.checkpoint_iterations[-1])
+    else:
+        scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -141,12 +152,34 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         Ll1 = l1_loss(image, gt_image)
         ssim_loss = (1.0 - ssim(image, gt_image))
 
+        # CUDA kernel change / depth loss + norma
+        # normal loss (depth-normal)
+
+        #render_normal = render_pkg["render_normal"] # -1 ~ 1
+        #depth_normal = render_pkg["depth_normal"] # -1 ~ 1
+        #gt_normal = viewpoint_cam.normal         
+        #normal_depth = (F.normalize(normal_depth, p=2, dim=0)+1)/2 #0~1
+
+        #loss_normal_gt = l1_loss(render_normal, gt_normal) # from StableNormal
+        #loss_normal_depth = l1_loss(render_normal, depth_normal) # self consistency
+        #loss_normal_uncert = 0. # uncertainty-aware normal smoothness
+        # depth loss (additonal priors)
+        #depth_gs = render_pkg["render_depth"]
+        #depth_gs=depth_gs/depth_gs.max()
+        #         
+        # depth loss (pseudo depth / variance)
+        # proposed method (uncertainty)
+
+        # rendered uncertainty (rendered flattness)
+        #loss += args.uncertainty_weight * uncertainty_loss
+
         # additional regularization
         ######################################################
         # 0) self-regularization loss (geometry)
         scaling_reg = scaling.prod(dim=1).mean() # Scaffold-GS
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + args.lambda_all_scale * scaling_reg
 
+        """
         # 1) flattness loss
         if visibility_filter.sum() > 0:
             scale = scaling[visibility_filter]
@@ -175,12 +208,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         spectral_energy = (-1 * (prob * torch.log(prob)).sum(-1)).mean()
         
         logging_dict = {}
-        logging_dict['scaling_reg'] = scaling_reg.item()
-        logging_dict['flattness (mean)'] = min_scale_loss.mean().item()
-        logging_dict['spectral_energy'] = spectral_energy.item()
-        logging_dict['spectral_energy_2d'] = spectral_energy_2d.item()
-        logging_dict['area_2d'] = area.mean().item()
-
+        logging_dict['observ/scaling_reg'] = scaling_reg.item()
+        logging_dict['observ/flattness (mean)'] = min_scale_loss.mean().item()
+        logging_dict['observ/spectral_energy'] = spectral_energy.item()
+        logging_dict['observ/spectral_energy_2d'] = spectral_energy_2d.item()
+        logging_dict['observ/area_2d'] = area.mean().item()
+        logging_dict['observ/condition_num'] = condition_number.mean()
+        logging_dict['observ/condition_num_mid'] = condition_number_mid.mean()
+        """
+        logging_dict = {}
+        # swapping loss
+#        logging_dict['opacity-aware/condition_num_mid'] = condition_number.mean()
         # add coding
         #logging_dict['axis_swapping_100'] = 0.
         #logging_dict['axis_swapping_500'] = 0.
@@ -262,8 +300,8 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
     if wandb is not None:
         if logging_dict is not None:
-            logging_dict['train_l1_loss'] = Ll1
-            logging_dict['train_total_loss'] = loss
+            logging_dict['Loss/train_l1_loss'] = Ll1
+            logging_dict['Loss/train_total_loss'] = loss
             wandb.log(logging_dict)
         else:
             wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })

@@ -13,11 +13,14 @@ from einops import repeat
 
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from diff_plane_rasterization import GaussianRasterizationSettings as PlaneGaussianRasterizationSettings
+from diff_plane_rasterization import GaussianRasterizer as PlaneGaussianRasterizer
+
 from scene.gaussian_model import GaussianModel
 from utils.general_utils import build_rotation
 from utils.graphics_utils import normal_from_depth_image
         
-def get_render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
+def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
 #def get_render_normal(viewpoint_cam, depth):
     # depth: (H, W), bg_color: (3), alpha: (H, W)
     # normal_ref: (3, H, W)
@@ -252,6 +255,124 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             
     return return_dict
 
+def render_PGSR(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, radius=0, out_depth=True, return_normal=True):
+    """
+    Render the scene. 
+    
+    Background tensor (bg_color) must be on GPU!
+    """
+    is_training = pc.get_color_mlp.training
+        
+    if is_training:
+        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+    else:
+        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points_abs = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    
+    if retain_grad:
+        try:
+            screenspace_points.retain_grad()
+        except:
+            pass
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    
+    raster_settings = PlaneGaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=1,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        render_geo=True,
+        debug=pipe.debug
+    )
+
+    rasterizer = PlaneGaussianRasterizer(raster_settings=raster_settings)
+    
+    rotations_mat = build_rotation(rot)
+    scales = scaling
+    min_scales = torch.argmin(scales, dim=1)
+    indices = torch.arange(min_scales.shape[0])
+    normal = rotations_mat[indices, :, min_scales]
+
+    view_dir = xyz - viewpoint_camera.camera_center
+    normal = (
+        normal * ((((view_dir * normal).sum(dim=-1) < 0) * 1 - 0.5) * 2)[..., None]
+    )
+
+    # TODO check
+    depth_z = view_dir[:, -1]
+    local_distance = (normal * view_dir).sum(-1).abs()
+    input_all_map = torch.ones((xyz.shape[0], 7)).cuda().float()
+    input_all_map[:, :3] = normal
+    input_all_map[:, 3] = 1.0
+    input_all_map[:, 4] = local_distance
+    # uncertainty
+    sorted_scale, _ = torch.sort(scaling, dim=-1)
+    input_all_map[:, 5] = sorted_scale[..., 0] # uncertainty # TODO
+ #   # add depth
+    input_all_map[:, 6] = (xyz-viewpoint_camera.camera_center).norm(dim=1)
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    rendered_image, radii, out_observe, out_all_map, plane_depth = rasterizer(
+        means3D = xyz,
+        means2D = screenspace_points,
+        means2D_abs = screenspace_points_abs,
+        shs = None,
+        colors_precomp = color,
+        opacities = opacity,
+        scales = scaling,
+        rotations = rot,
+        all_map = input_all_map, 
+        cov3D_precomp = None)
+
+    rendered_normal = out_all_map[0:3]
+    rendered_alpha = out_all_map[3:4, ]
+    rendered_distance = out_all_map[4:5, ]
+    rendered_uncert = out_all_map[5:6, ]
+    rendered_depth = out_all_map[6:7, ]
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    if is_training:
+        return_dict = {"render": rendered_image,
+                "viewspace_points": screenspace_points,
+                "visibility_filter" : radii > 0,
+                "radii": radii,
+                "selection_mask": mask,
+                "neural_opacity": neural_opacity,
+                "scaling": scaling,
+                "rendered_normal": rendered_normal,
+                "plane_depth": plane_depth,
+                "rendered_distance": rendered_distance,
+#                "rendered_uncert": rendered_uncert,
+ #               "rendered_depth": rendered_depth
+                }
+    else:
+        return_dict = {"render": rendered_image,
+                "viewspace_points": screenspace_points,
+                "visibility_filter" : radii > 0,
+                "radii": radii,
+                "rendered_normal": rendered_normal,
+                "plane_depth": plane_depth,
+                "rendered_distance": rendered_distance,
+  #              "rendered_uncert": rendered_uncert,
+  #              "rendered_depth": rendered_depth
+                }
+
+    # additional estimation
+    depth_normal = render_normal(viewpoint_camera, plane_depth.squeeze()) * (rendered_alpha).detach()
+    return_dict.update({"depth_normal": depth_normal})
+    return return_dict
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """

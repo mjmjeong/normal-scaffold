@@ -155,6 +155,12 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # regularization
+        self.lambda_min_scale = 0.0
+        self.lambda_opacity = 0.0
+        self.lambda_spectral_2d = 0.0
+        self.lambda_all_scale = 0.01
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
