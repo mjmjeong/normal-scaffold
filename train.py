@@ -367,9 +367,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    depth_plane_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depths_plane")
+    depth_dist_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depths_distance")
+
     makedirs(render_path, exist_ok=True)
     makedirs(error_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    makedirs(depth_plane_path, exist_ok=True)
+    makedirs(depth_dist_path, exist_ok=True)
     
     t_list = []
     visible_count_list = []
@@ -397,11 +402,20 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # error maps
         errormap = (rendering - gt).abs()
 
+        depth = render_pkg['plane_depth']
+        depth = (depth.max() - depth) / (depth.max())
+
 
         name_list.append('{0:05d}'.format(idx) + ".png")
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(depth, os.path.join(depth_plane_path, '{0:05d}'.format(idx) + ".png"))
+
+        depth = render_pkg['rendered_distance']
+        depth = (depth.max() - depth) / (depth.max())
+        torchvision.utils.save_image(depth, os.path.join(depth_dist_path, '{0:05d}'.format(idx) + ".png"))
+
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
     
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:

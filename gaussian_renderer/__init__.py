@@ -255,7 +255,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             
     return return_dict
 
-def render_PGSR(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, radius=0, out_depth=True, return_normal=True):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, radius=0, out_depth=True, return_normal=True):
     """
     Render the scene. 
     
