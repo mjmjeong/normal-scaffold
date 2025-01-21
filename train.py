@@ -45,6 +45,9 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
+from torchmetrics import PearsonCorrCoef
+from torchmetrics.functional.regression import pearson_corrcoef
+
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
@@ -145,9 +148,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, out_depth=False, return_normal=False)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, out_depth=True, return_normal=False)
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
         
+        loss = 0.
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -164,7 +168,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         #loss_normal_depth = l1_loss(render_normal, depth_normal) # self consistency
         #loss_normal_uncert = 0. # uncertainty-aware normal smoothness
         # depth loss (additonal priors)
-        #depth_gs = render_pkg["render_depth"]
+        if args.lambda_depth > 0:
+            rendered_depth = render_pkg["rendered_distance"] / render_pkg["rendered_distance"].max()
+            rendered_depth=rendered_depth[:1,:,:]
+            gt_depth = viewpoint_cam.depth
+
+            rendered_depth = rendered_depth.reshape(-1, 1)
+            gt_depth = gt_depth.reshape(-1, 1)
+
+            depth_loss = min(
+                            (1 - pearson_corrcoef(- gt_depth, rendered_depth)),
+                            (1 - pearson_corrcoef(1 / (gt_depth + 200.), rendered_depth))
+            )
+            loss += args.lambda_depth * depth_loss
         #depth_gs=depth_gs/depth_gs.max()
         #         
         # depth loss (pseudo depth / variance)
@@ -177,7 +193,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         ######################################################
         # 0) self-regularization loss (geometry)
         scaling_reg = scaling.prod(dim=1).mean() # Scaffold-GS
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + args.lambda_all_scale * scaling_reg
+        loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + args.lambda_all_scale * scaling_reg
 
         """
         # 1) flattness loss
@@ -385,7 +401,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torch.cuda.synchronize();t_start = time.time()
         
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
+        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, out_depth=True)
         torch.cuda.synchronize();t_end = time.time()
 
         t_list.append(t_end - t_start)

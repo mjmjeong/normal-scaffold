@@ -219,8 +219,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rot,
             cov3D_precomp = None)
         rendered_depth_hand = out[0]
-        return_dict.update({'est_depth': rendered_depth_hand})
-        return_dict['depth_normal'] = get_render_normal(viewpoint_camera, rendered_depth_hand[0]) 
+        return_dict.update({'rendered_distance': rendered_depth_hand})
+        return_dict.update({'plane_depth': rendered_depth_hand})
+        return_dict['depth_normal'] = render_normal(viewpoint_camera, rendered_depth_hand[0]) 
         
     if return_normal:
         # Get the predicted normal of the Scaffold-GS, code get from Gaussian-pro
@@ -248,14 +249,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations=rot,
             cov3D_precomp=None,
         )
-        render_normal = out[0]
-        render_normal = torch.nn.functional.normalize(render_normal, dim=0)
+        render_normal_out = out[0]
+        render_normal_out = torch.nn.functional.normalize(render_normal_out, dim=0)
 
-        return_dict.update({'render_normal': render_normal})
+        return_dict.update({'render_normal': render_normal_out})
             
     return return_dict
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, radius=0, out_depth=True, return_normal=True):
+def render2(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, radius=0, out_depth=True, return_normal=True):
     """
     Render the scene. 
     

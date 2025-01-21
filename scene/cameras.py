@@ -20,7 +20,7 @@ class Camera(nn.Module):
                 image_width, image_height, 
                 image_path, image_name, uid, 
                 image, gt_alpha_mask,
-                normal,
+                normal, depth,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
                  ):
         super(Camera, self).__init__()
@@ -58,7 +58,17 @@ class Camera(nn.Module):
         else:
             self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
 
-        self.normal = 2 * normal.to(self.data_device) - 1
+        if normal is not None:
+            self.normal = 2 * normal.to(self.data_device) - 1
+        else:
+            self.normal = None
+
+        if depth is not None:
+            self.depth = self.depth.to(self.data_device)
+        else:
+            self.depth = None
+        
+
         self.zfar = 100.0
         self.znear = 0.01
 

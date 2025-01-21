@@ -43,13 +43,21 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     gt_image = resized_image_rgb[:3, ...]
     
-    
-    resized_normal_rgb = PILtoTorch(cam_info.normal)
-    gt_normal = resized_normal_rgb[:3, ...]
+    if cam_info.depth is not None:
+        resized_depth_rgb = PILtoTorch(cam_info.depth, resolution)
+        gt_depth = resized_depth_rgb[:3, ...]
+    else:
+        gt_depth = None    
 
-    # size check for nearest neighbor
-    if gt_normal.size(-1) != gt_image.size(-1) or gt_normal.size(-2) != gt_image.size(-2):
-        gt_normal = F.interpolate(gt_normal.unsqueeze(0), size=(gt_image.size(-2),gt_image.size(-1)), mode='nearest')[0]
+    if cam_info.normal is not None:
+        resized_normal_rgb = PILtoTorch(cam_info.normal)
+        gt_normal = resized_normal_rgb[:3, ...]
+        # size check for nearest neighbor
+        if gt_normal.size(-1) != gt_image.size(-1) or gt_normal.size(-2) != gt_image.size(-2):
+            gt_normal = F.interpolate(gt_normal.unsqueeze(0), size=(gt_image.size(-2),gt_image.size(-1)), mode='nearest')[0]
+    else:
+        gt_normal = None
+        
     loaded_mask = None
 
     # print(f'gt_image: {gt_image.shape}')
@@ -61,7 +69,7 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image_height=cam_info.height, image_width=cam_info.width,
                   image_path=cam_info.image_path, image_name=cam_info.image_name, uid=id, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  normal=gt_normal, 
+                  normal=gt_normal, depth=gt_depth,
                   data_device=args.data_device,
 )
 

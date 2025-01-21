@@ -160,7 +160,9 @@ class OptimizationParams(ParamGroup):
         self.lambda_opacity = 0.0
         self.lambda_spectral_2d = 0.0
         self.lambda_all_scale = 0.01
-        
+         
+        self.lambda_depth = 0.0
+        self.lambda_normal = 0.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

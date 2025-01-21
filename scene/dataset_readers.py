@@ -44,7 +44,8 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     normal: np.array
-
+    depth: np.array
+    
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
@@ -120,10 +121,20 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             normal = Image.open(normal_path)
         except:
             normal = None
+        
+        try:
+            if "DTU" in images_folder:
+                depth_path = os.path.join(Path(images_folder).parent , "depths", "00" + os.path.basename(extr.name))
+            else:
+                depth_path = os.path.join(Path(images_folder).parent , "depths", os.path.basename(extr.name))
+            depth_name = os.path.basename(depth_path).split(".")[0]
+            depth = Image.open(depth_path)
+        except:
+            depth = None
         # print(f'image: {image.size}')
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height, normal=normal)
+                              image_path=image_path, image_name=image_name, width=width, height=height, normal=normal, depth=depth)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
