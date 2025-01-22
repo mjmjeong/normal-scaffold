@@ -154,15 +154,23 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
-
-        # regularization
+        
+        # depth
+        self.lambda_depth = 0.0
+        # normal
+        self.lambda_consistency = 0.0
+        self.lambda_n_gt_render = 0.0
+        self.lambda_n_gt_depth = 0.0
+        self.use_uncertainty = False
+        self.lambda_uncertainty = 0.0
+        # geometric regularization
         self.lambda_min_scale = 0.0
         self.lambda_opacity = 0.0
         self.lambda_spectral_2d = 0.0
-        self.lambda_all_scale = 0.01
-         
-        self.lambda_depth = 0.0
-        self.lambda_normal = 0.0
+        self.lambda_all_scale = 0.01 #scaffold default
+        self.lambda_uncert_only = 0.0
+        self.lambda_2d_area = 0.0
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

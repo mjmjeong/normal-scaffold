@@ -64,7 +64,7 @@ class Camera(nn.Module):
             self.normal = None
 
         if depth is not None:
-            self.depth = self.depth.to(self.data_device)
+            self.depth = depth.to(self.data_device)
         else:
             self.depth = None
         

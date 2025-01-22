@@ -56,7 +56,6 @@ def show_normal(img_path, tensor_CHW):
     normal_rgb = ((tensor_HWC + 1) * 0.5) * 255
     normal_rgb = np.clip(normal_rgb, a_min=0, a_max=255)
     normal_rgb = normal_rgb.astype(np.uint8)
-
     plt.imsave(img_path, normal_rgb)
 
 try:
@@ -148,26 +147,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, out_depth=True, return_normal=False)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, out_depth=True, return_normal=True)
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
         
-        loss = 0.
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         ssim_loss = (1.0 - ssim(image, gt_image))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
 
-        # CUDA kernel change / depth loss + norma
-        # normal loss (depth-normal)
-
-        #render_normal = render_pkg["render_normal"] # -1 ~ 1
-        #depth_normal = render_pkg["depth_normal"] # -1 ~ 1
-        #gt_normal = viewpoint_cam.normal         
-        #normal_depth = (F.normalize(normal_depth, p=2, dim=0)+1)/2 #0~1
-
-        #loss_normal_gt = l1_loss(render_normal, gt_normal) # from StableNormal
-        #loss_normal_depth = l1_loss(render_normal, depth_normal) # self consistency
-        #loss_normal_uncert = 0. # uncertainty-aware normal smoothness
-        # depth loss (additonal priors)
+        if args.lambda_all_scale > 0:
+            scaling_reg = scaling.prod(dim=1).mean() # Scaffold-GS
+            loss +=  args.lambda_all_scale * scaling_reg
+        
+        # depth prior
         if args.lambda_depth > 0:
             rendered_depth = render_pkg["rendered_distance"] / render_pkg["rendered_distance"].max()
             rendered_depth=rendered_depth[:1,:,:]
@@ -175,72 +167,108 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             rendered_depth = rendered_depth.reshape(-1, 1)
             gt_depth = gt_depth.reshape(-1, 1)
-
-            depth_loss = min(
-                            (1 - pearson_corrcoef(- gt_depth, rendered_depth)),
-                            (1 - pearson_corrcoef(1 / (gt_depth + 200.), rendered_depth))
-            )
+            # depth_loss = min(
+            #                (1 - pearson_corrcoef(-gt_depth, rendered_depth)),
+            #                (1 - pearson_corrcoef(1. / (gt_depth + 200.), rendered_depth))
+            #)
+            depth_loss = 1 - pearson_corrcoef(-gt_depth, rendered_depth)
             loss += args.lambda_depth * depth_loss
-        #depth_gs=depth_gs/depth_gs.max()
-        #         
-        # depth loss (pseudo depth / variance)
-        # proposed method (uncertainty)
 
-        # rendered uncertainty (rendered flattness)
-        #loss += args.uncertainty_weight * uncertainty_loss
+        ############################################
+        # normal        
+        #############################################
+        rendered_normal = render_pkg['render_normal']
+        rendered_depth_normal = render_pkg['depth_normal'].detach()
+        gt_normal = -1 * viewpoint_cam.normal
 
-        # additional regularization
-        ######################################################
-        # 0) self-regularization loss (geometry)
-        scaling_reg = scaling.prod(dim=1).mean() # Scaffold-GS
-        loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + args.lambda_all_scale * scaling_reg
-
-        """
-        # 1) flattness loss
-        if visibility_filter.sum() > 0:
-            scale = scaling[visibility_filter]
-            sorted_scale, _ = torch.sort(scale, dim=-1)
-            min_scale_loss = sorted_scale[..., 0]
-            loss += args.lambda_min_scale * min_scale_loss.mean()
-
-        # 2) opacity loss (0 or 1)
-        tgt_opacity = opacity[opacity>0]
-        opacity_loss = -1 * (tgt_opacity * torch.log(tgt_opacity+1e-10) + (1-tgt_opacity) * torch.log(1-tgt_opacity))
-        loss += args.lambda_opacity * opacity_loss.mean()
-
-        # 3) observation: area / 2d spectral entropy
-        sorted_scale_all, _ = torch.sort(scaling, dim=-1)
-        area = sorted_scale_all[..., -1] * sorted_scale_all[..., -2]
-        prob_2d = sorted_scale[..., 1:] / sorted_scale[..., 1:].sum(-1, keepdim=True)
-        spectral_energy_2d = (-1 * (prob_2d * torch.log(prob_2d)).sum(-1) ).mean()
-        loss += args.lambda_spectral_2d * (-1 * spectral_energy_2d)
-
-        # observation: condition number 
-        condition_number =  sorted_scale[..., -1] / sorted_scale[..., 0] #max/min
-        condition_number_mid =  sorted_scale[..., 1] / sorted_scale[..., 0] #mid/min
-
-        # observation: spectral entropy
-        prob = sorted_scale_all / sorted_scale_all.sum(-1, keepdim=True)
-        spectral_energy = (-1 * (prob * torch.log(prob)).sum(-1)).mean()
+        loss_normal = 0.
+        # normal starting
+        if iteration > 5000:
+            # depth-normal consistency
+            if args.lambda_consistency > 0:        
+                loss_consistency  = 1 - (rendered_normal * rendered_depth_normal).sum(dim=0)
+                loss_normal += args.lambda_consistency  * loss_consistency 
         
-        logging_dict = {}
-        logging_dict['observ/scaling_reg'] = scaling_reg.item()
-        logging_dict['observ/flattness (mean)'] = min_scale_loss.mean().item()
-        logging_dict['observ/spectral_energy'] = spectral_energy.item()
-        logging_dict['observ/spectral_energy_2d'] = spectral_energy_2d.item()
-        logging_dict['observ/area_2d'] = area.mean().item()
-        logging_dict['observ/condition_num'] = condition_number.mean()
-        logging_dict['observ/condition_num_mid'] = condition_number_mid.mean()
-        """
-        logging_dict = {}
-        # swapping loss
-#        logging_dict['opacity-aware/condition_num_mid'] = condition_number.mean()
-        # add coding
-        #logging_dict['axis_swapping_100'] = 0.
-        #logging_dict['axis_swapping_500'] = 0.
-        #logging_dict['axis_swapping_1000'] = 0.
-        # spectral-gs / variance of minimum axis optimization / uncertainty (flattness) / ratio 
+            # prior from gt
+            if args.lambda_n_gt_render > 0:
+                loss_cosine = (1 - (rendered_normal * gt_normal).sum(dim=0)).mean()
+                loss_l1 = F.l1_loss(rendered_normal, gt_normal)
+                loss_normal += args.lambda_n_gt_render * (loss_cosine + loss_l1)
 
+            if args.lambda_n_gt_depth > 0:
+                loss_cosine = (1 - (rendered_normal * gt_normal).sum(dim=0)).mean()
+                loss_l1 = F.l1_loss(rendered_normal, gt_normal)
+                loss_normal += args.lambda_n_gt_depth * (loss_cosine + loss_l1)
+
+            if args.use_uncertainty:
+                render_uncertainty = render_pkg['uncertainty'].mean()
+                loss_normal = (loss_normal / (render_uncertainty + 1e-10)).mean() + args.lambda_uncertainty * render_uncertainty.mean()
+            else:
+                loss_normal = loss_normal.mean()
+            loss += loss_normal                        
+
+        ############################################
+        # geometric (global)
+        #############################################
+        logging_dict = {}
+            
+        if iteration > 5000:
+            # 1) min scale
+            if args.lambda_min_scale > 0:
+                sorted_scale, _ = torch.sort(scaling, dim=-1)
+                min_scale_loss = sorted_scale[..., 0]
+                loss += args.lambda_min_scale * min_scale_loss.mean()
+
+            # 2) rendered uncertainty
+            if args.lambda_uncert_only > 0:
+                uncertainty_loss = render_pkg['uncertainty'].mean()
+                loss += args.lambda_uncert_only * uncertainty_loss
+                
+            # 3) spectral
+            sorted_scale, _ = torch.sort(scaling, dim=-1)
+            prob = sorted_scale / sorted_scale.sum(-1, keepdim=True)
+            spectral_energy = (-1 * (prob * torch.log(prob)).sum(-1)).mean()
+
+            # 4) spectral 2d
+            prob_2d = sorted_scale[..., 1:] / sorted_scale[..., 1:].sum(-1, keepdim=True)
+            spectral_energy_2d = (-1 * (prob_2d * torch.log(prob_2d)).sum(-1) ).mean()
+            if args.lambda_spectral_2d > 0:
+                loss += args.lambda_spectral_2d * (-1 * spectral_energy_2d)
+
+            # 4) area
+            area = sorted_scale[..., -1] * sorted_scale[..., -2]
+            if args.lambda_2d_area >0:
+                loss += args.lambda_2d_area * (sorted_scale[..., -1] * sorted_scale[..., -2]).mean()            
+
+            if args.lambda_opacity > 0:
+                tgt_opacity = opacity[opacity>0]
+                opacity_loss = -1 * (tgt_opacity * torch.log(tgt_opacity+1e-10) + (1-tgt_opacity) * torch.log(1-tgt_opacity))
+                loss += args.lambda_opacity * opacity_loss.mean()
+        
+            # observation: condition number 
+            condition_number =  sorted_scale[..., -1] / sorted_scale[..., 0] #max/min
+            condition_number_mid =  sorted_scale[..., 1] / sorted_scale[..., 0] #mid/min
+            logging_dict['observ/scaling_reg'] = scaling_reg.item()
+            logging_dict['observ/spectral_energy'] = spectral_energy.item()
+            logging_dict['observ/spectral_energy_2d'] = spectral_energy_2d.item()
+            logging_dict['observ/condition_num'] = condition_number.mean()
+            logging_dict['observ/condition_num_mid'] = condition_number_mid.mean()
+
+            # TODO: axis swapping logging      
+            # add coding
+            #logging_dict['axis_swapping_100'] = 0.
+            #logging_dict['axis_swapping_500'] = 0.
+            #logging_dict['axis_swapping_1000'] = 0.
+            # spectral-gs / variance of minimum axis optimization / uncertainty (flattness) / ratio 
+
+        #########################################################################
+        # unseen cam
+        #########################################################################
+        # unseen cam
+        """
+
+
+        """
         loss.backward()        
         iter_end.record()
 
@@ -383,14 +411,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    depth_plane_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depths_plane")
+    depth_normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth_normal")
     depth_dist_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depths_distance")
+    normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "normal")
 
     makedirs(render_path, exist_ok=True)
     makedirs(error_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
-    makedirs(depth_plane_path, exist_ok=True)
+    makedirs(depth_normal_path, exist_ok=True)
     makedirs(depth_dist_path, exist_ok=True)
+    makedirs(normal_path, exist_ok=True)
     
     t_list = []
     visible_count_list = []
@@ -401,7 +431,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torch.cuda.synchronize();t_start = time.time()
         
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, out_depth=True)
+        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, out_depth=True, return_normal=True)
         torch.cuda.synchronize();t_end = time.time()
 
         t_list.append(t_end - t_start)
@@ -418,15 +448,19 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # error maps
         errormap = (rendering - gt).abs()
 
-        depth = render_pkg['plane_depth']
-        depth = (depth.max() - depth) / (depth.max())
+        depth_normal = render_pkg['depth_normal']
+        depth_normal = (F.normalize(-1 * depth_normal, p=2, dim=0)+1)/2 #0~1
 
-
+        # normal
+        normal = render_pkg["render_normal"] # -1 ~ 1
+        normal = (F.normalize(-1 * normal, p=2, dim=0)+1)/2 #0~1
+        
         name_list.append('{0:05d}'.format(idx) + ".png")
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(depth, os.path.join(depth_plane_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(depth_normal, os.path.join(depth_normal_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(idx) + ".png"))
 
         depth = render_pkg['rendered_distance']
         depth = (depth.max() - depth) / (depth.max())
