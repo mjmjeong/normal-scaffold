@@ -35,7 +35,7 @@ import torch.nn.functional as F
 import lpips
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import prefilter_voxel, render, network_gui
+from gaussian_renderer import prefilter_voxel, render, render_gsplat, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -147,7 +147,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, out_depth=True, return_normal=True)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad, return_normal_depth=True, args=args)
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
         
         gt_image = viewpoint_cam.original_image.cuda()
@@ -159,9 +159,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             scaling_reg = scaling.prod(dim=1).mean() # Scaffold-GS
             loss +=  args.lambda_all_scale * scaling_reg
         
-        # depth prior
+        ############################################
+        # depth 
+        #############################################        
         if args.lambda_depth > 0:
-            rendered_depth = render_pkg["rendered_distance"] / render_pkg["rendered_distance"].max()
+            # TODO: 
+            rendered_depth = render_pkg["depth_expected"] / render_pkg["depth_expected"].max() 
             rendered_depth=rendered_depth[:1,:,:]
             gt_depth = viewpoint_cam.depth
 
@@ -177,8 +180,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         ############################################
         # normal        
         #############################################
-        rendered_normal = render_pkg['render_normal']
-        rendered_depth_normal = render_pkg['depth_normal'].detach()
+        rendered_normal = render_pkg['normal_expected']
+        rendered_depth_normal = render_pkg['normal_depth'].detach()
         gt_normal = -1 * viewpoint_cam.normal
 
         loss_normal = 0.
@@ -201,18 +204,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 loss_normal += args.lambda_n_gt_depth * (loss_cosine + loss_l1)
 
             if args.use_uncertainty:
-                render_uncertainty = render_pkg['uncertainty'].mean()
+                render_uncertainty = render_pkg['normal_uncert'].mean()
                 loss_normal = (loss_normal / (render_uncertainty + 1e-10)).mean() + args.lambda_uncertainty * render_uncertainty.mean()
             else:
                 loss_normal = loss_normal.mean()
             loss += loss_normal                        
 
         ############################################
-        # geometric (global)
+        # geometric regularization (global)
         #############################################
         logging_dict = {}
             
-        if iteration > 5000:
+        if iteration > 5000: 
             # 1) min scale
             if args.lambda_min_scale > 0:
                 sorted_scale, _ = torch.sort(scaling, dim=-1)
@@ -221,7 +224,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             # 2) rendered uncertainty
             if args.lambda_uncert_only > 0:
-                uncertainty_loss = render_pkg['uncertainty'].mean()
+                uncertainty_loss = render_pkg['normal_uncert'].mean()
                 loss += args.lambda_uncert_only * uncertainty_loss
                 
             # 3) spectral
@@ -264,10 +267,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         #########################################################################
         # unseen cam
         #########################################################################
-        # unseen cam
         """
-
-
+        for unseen cam: depth-normal consistency / depth smoothness
         """
         loss.backward()        
         iter_end.record()
@@ -431,7 +432,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torch.cuda.synchronize();t_start = time.time()
         
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, out_depth=True, return_normal=True)
+        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, return_normal_depth=True)
         torch.cuda.synchronize();t_end = time.time()
 
         t_list.append(t_end - t_start)
@@ -448,11 +449,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # error maps
         errormap = (rendering - gt).abs()
 
-        depth_normal = render_pkg['depth_normal']
+        depth_normal = render_pkg['normal_depth']
         depth_normal = (F.normalize(-1 * depth_normal, p=2, dim=0)+1)/2 #0~1
 
         # normal
-        normal = render_pkg["render_normal"] # -1 ~ 1
+        normal = render_pkg["normal_expected"] # -1 ~ 1
         normal = (F.normalize(-1 * normal, p=2, dim=0)+1)/2 #0~1
         
         name_list.append('{0:05d}'.format(idx) + ".png")
@@ -462,9 +463,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(depth_normal, os.path.join(depth_normal_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(idx) + ".png"))
 
-        depth = render_pkg['rendered_distance']
+        depth = render_pkg['depth_expected']
         depth = (depth.max() - depth) / (depth.max())
         torchvision.utils.save_image(depth, os.path.join(depth_dist_path, '{0:05d}'.format(idx) + ".png"))
+
 
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
     

@@ -78,6 +78,9 @@ class ModelParams(ParamGroup):
         
         # fewshot
         self.fewshot_num = -1
+        # functional
+        self.depth_to_normal_func = 'gsurf'
+        self.depth_correlation_with_alpha = False
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -158,6 +161,9 @@ class OptimizationParams(ParamGroup):
         # depth
         self.lambda_depth = 0.0
         # normal
+        # self.lambda_consistency = 0.015
+        # self.lambda_n_gt_render = 0.015
+        # self.lambda_n_gt_depth = 0.04
         self.lambda_consistency = 0.0
         self.lambda_n_gt_render = 0.0
         self.lambda_n_gt_depth = 0.0
