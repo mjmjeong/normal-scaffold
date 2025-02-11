@@ -22,7 +22,7 @@ from utils.general_utils import build_rotation
 from utils.graphics_utils import normal_from_depth_image 
 
 import gsplat
-from gsplat.rendering import rasterization
+from gsplat.rendering import rasterization, rasterization_2dgs
         
 def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
 #def get_render_normal(viewpoint_cam, depth):
@@ -246,6 +246,103 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
                 "normal_depth": render_normals_from_depth, # world
                 "normal_local": normals_local,
                 "normal_uncert": uncert,
+                "viewspace_points": info['means2d'],
+                "visibility_filter" : info['radii'][0] > 0,
+                "radii": info['radii'][0],
+                }
+    
+    return return_dict
+
+def render_gsplat_2dgs(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, out_depth=False, return_normal=False, radius=0, args=None):
+    is_training = pc.get_color_mlp.training
+        
+    if is_training:
+        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+    else:
+        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+    
+    # intrinsic & extrinsic
+    Ks = torch.eye(3).cuda() # TODO
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    Ks[0, 0] = viewpoint_camera.image_width / (2*tanfovx)
+    Ks[1, 1] = viewpoint_camera.image_height / (2*tanfovy)
+    Ks[0,-1] = viewpoint_camera.image_width/2
+    Ks[1,-1] = viewpoint_camera.image_height/2
+    viewmats = viewpoint_camera.world_view_transform.transpose(0,1)
+    
+    # infos: rgb, normal
+    depth = (xyz-viewpoint_camera.camera_center).norm(dim=1, keepdim=True)
+    features = torch.cat((color, depth), -1)
+
+    render_feats, alphas, normals, surf_normals, dist_loss, depth_median, info = rasterization_2dgs(
+            means=xyz,
+            quats=rot, 
+            scales=scaling*scaling_modifier,
+            opacities=opacity[:,0],
+            colors=features[None],
+            sh_degree=None, 
+            viewmats=viewmats[None],
+            Ks=Ks[None],
+            width=int(viewpoint_camera.image_width),
+            height=int(viewpoint_camera.image_height),
+            packed=False,
+            absgrad=False,
+            sparse_grad=False,
+#            rasterize_mode="classic",
+            render_mode='RGB+D', # check depth vs expected depth
+#            distributed=False,
+            backgrounds=None,
+            depth_mode='expected',
+            near_plane=0.01,
+            far_plane=100 
+        )
+
+    if retain_grad:
+        info['gradient_2dgs'].retain_grad()
+    
+    # others
+    image = render_feats[..., :3].permute(0,3,1,2)[0]
+    uncert =render_feats[..., 4:5].permute(0,3,1,2)[0]
+    
+    normals = normals.permute(0,3,1,2)[0]
+    normals = torch.nn.functional.normalize(normals, dim=0)
+    render_normals_from_depth = surf_normals.permute(2,0,1)
+    render_normals_from_depth =  torch.nn.functional.normalize(render_normals_from_depth, dim=0)
+
+    # depth & normal
+    depth_alpha = render_feats[..., 3:4]
+    if args.depth_correlation_with_alpha:
+        depth_alpha = depth_alpha / render_alphas.clamp(min=1e-10)
+    depth_alpha = depth_alpha.permute(0,3,1,2)[0]
+
+    R_w2c = torch.tensor(viewpoint_camera.R.T).cuda().to(torch.float32)
+    normals_local = (R_w2c @ normals.reshape(3, -1)).reshape(3, viewpoint_camera.image_height, viewpoint_camera.image_width)
+    
+    if is_training:
+        return_dict = {"render": image,
+                "depth_median": depth_median,
+                "depth_expected": depth_alpha, 
+                "normal_expected": normals, # world: expected
+                "normal_depth": render_normals_from_depth, # world: from depth
+                "normal_local": normals_local, # cam: expected
+                #"normal_uncert": uncert,
+                "viewspace_points": info['means2d'],
+                "visibility_filter" : info['radii'][0] > 0,
+                "radii": info['radii'][0],
+                "selection_mask": mask,
+                "neural_opacity": neural_opacity,
+                "scaling": scaling,
+                "info": info, 
+                }
+    else:
+        return_dict = {"render": image,
+                "depth_median": depth_median,
+                "depth_expected": depth_alpha, 
+                "normal_expected": normals, # world
+                "normal_depth": render_normals_from_depth, # world
+                "normal_local": normals_local,
+                #"normal_uncert": uncert,
                 "viewspace_points": info['means2d'],
                 "visibility_filter" : info['radii'][0] > 0,
                 "radii": info['radii'][0],
