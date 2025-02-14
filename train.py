@@ -170,6 +170,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             rendered_depth = rendered_depth.reshape(-1, 1)
             gt_depth = gt_depth.reshape(-1, 1)
+            # TODO: check
             # depth_loss = min(
             #                (1 - pearson_corrcoef(-gt_depth, rendered_depth)),
             #                (1 - pearson_corrcoef(1. / (gt_depth + 200.), rendered_depth))
@@ -206,8 +207,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if args.use_uncertainty:
                 render_uncertainty = render_pkg['normal_uncert'].mean()
                 loss_normal = (loss_normal / (render_uncertainty + 1e-10)).mean() + args.lambda_uncertainty * render_uncertainty.mean()
-            else:
-                loss_normal = loss_normal.mean()
             loss += loss_normal                        
 
         ############################################

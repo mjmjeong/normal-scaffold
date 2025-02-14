@@ -167,7 +167,8 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     normal = (
         normal * ((((view_dir * normal).sum(dim=-1) < 0) * 1 - 0.5) * 2)[..., None]
     ) # world coord
-    
+    R_w2c = torch.tensor(viewpoint_camera.R.T).cuda().to(torch.float32)
+    normal = (R_w2c @ normal.transpose(0, 1)).transpose(0, 1)
     
     # 2) uncertainty
     sorted_scale, _ = torch.sort(scaling, dim=-1)
@@ -201,7 +202,7 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     # others
     image = render_feats[..., :3].permute(0,3,1,2)[0]
     normals = render_feats[..., 4:7].permute(0,3,1,2)[0]
-    normals = torch.nn.functional.normalize(normals, dim=0)
+    normals = torch.nn.functional.normalize(normals, dim=0) # TODO: check global ? local? 
     uncert =render_feats[..., 7:8].permute(0,3,1,2)[0]
     depth_median = render_feats[..., -1:].permute(0,3,1,2)[0]
 
@@ -212,6 +213,7 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
     
     if args.depth_to_normal_func == 'gsplat':
         render_normals_from_depth = gsplat.utils.depth_to_normal(depth_alpha, torch.linalg.inv(viewmats[None]), Ks[None]).squeeze(0).permute(2,0,1)
+        # NOTE: this is global coordinamtes!
         depth_alpha = depth_alpha.permute(0,3,1,2)[0]
     elif args.depth_to_normal_func == 'gsurf':
         depth_alpha = depth_alpha.permute(0,3,1,2)[0]
@@ -226,9 +228,8 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         return_dict = {"render": image,
                 "depth_median": depth_median,
                 "depth_expected": depth_alpha, 
-                "normal_expected": normals, # world: expected
-                "normal_depth": render_normals_from_depth, # world: from depth
-                "normal_local": normals_local, # cam: expected
+                "normal_expected": normals, # local coord: expected
+                "normal_depth": render_normals_from_depth, # local coord: from depth
                 "normal_uncert": uncert,
                 "viewspace_points": info['means2d'],
                 "visibility_filter" : info['radii'][0] > 0,
@@ -242,9 +243,8 @@ def render_gsplat(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
         return_dict = {"render": image,
                 "depth_median": depth_median,
                 "depth_expected": depth_alpha, 
-                "normal_expected": normals, # world
-                "normal_depth": render_normals_from_depth, # world
-                "normal_local": normals_local,
+                "normal_expected": normals, # local
+                "normal_depth": render_normals_from_depth, # local
                 "normal_uncert": uncert,
                 "viewspace_points": info['means2d'],
                 "visibility_filter" : info['radii'][0] > 0,
@@ -434,7 +434,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         normal = (
             normal * ((((view_dir * normal).sum(dim=-1) < 0) * 1 - 0.5) * 2)[..., None]
         )
-
+        R_w2c = torch.tensor(viewpoint_camera.R.T).cuda().to(torch.float32)
+        normal = (R_w2c @ normal.transpose(0, 1)).transpose(0, 1)
         
         out = rasterizer(
             means3D=xyz,
@@ -450,10 +451,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         render_normal_out = torch.nn.functional.normalize(render_normal_out, dim=0)
         return_dict['normal_expected'] = render_normal_out
     
-        R_w2c = torch.tensor(viewpoint_camera.R.T).cuda().to(torch.float32)
+        #R_w2c = torch.tensor(viewpoint_camera.R.T).cuda().to(torch.float32)
         #normal_local = (R_w2c @ normal.transpose(0, 1)).transpose(0, 1)
-        normals_local = (R_w2c @ render_normal_out.reshape(3, -1)).reshape(3, viewpoint_camera.image_height, viewpoint_camera.image_width)
-        return_dict['normal_local'] = normals_local
+        #normals_local = (R_w2c @ render_normal_out.reshape(3, -1)).reshape(3, viewpoint_camera.image_height, viewpoint_camera.image_width)
+        #return_dict['normal_local'] = normals_local
         
         ##############################################################################
         # uncertainty + depth
@@ -474,9 +475,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         
         rendered_depth_hand = out[0][:1, :, :,]
         rendered_uncert = out[0][1:2, :, :,]
-        
+
         return_dict['depth_expected'] = rendered_depth_hand
-        return_dict['normal_depth'] = render_normal(viewpoint_camera, rendered_depth_hand[0]) 
+        return_dict['normal_depth'] = render_normal(viewpoint_camera, rendered_depth_hand[0]) # local coordinates
         return_dict['normal_uncert'] = rendered_uncert
     return return_dict
 
