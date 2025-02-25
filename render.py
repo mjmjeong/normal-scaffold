@@ -14,11 +14,11 @@ import torch
 import numpy as np
 
 import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+#cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+#result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
+#os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 
-os.system('echo $CUDA_VISIBLE_DEVICES')
+#os.system('echo $CUDA_VISIBLE_DEVICES')
 
 from scene import Scene
 import json
@@ -30,41 +30,62 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
+from utils.pose_uilts import *
+import imageio 
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    if not os.path.exists(render_path):
-        os.makedirs(render_path)
-    if not os.path.exists(gts_path):
-        os.makedirs(gts_path)
+    render_path = os.path.join(model_path, name, "our_video_{}".format(iteration), "renders")
+    video_path = os.path.join(model_path, name)
+
+    os.makedirs(render_path, exist_ok=True)
+    os.makedirs(video_path, exist_ok=True)
 
     name_list = []
     per_view_dict = {}
     # debug = 0
     t_list = []
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+
+    view = views[0]
+    print(name, len(views))
+    #render_array = torch.stack(render_images, dim=0).permute(0, 2, 3, 1)
+    #render_array = (render_array*255).clip(0, 255).cpu().numpy().astype(np.uint8)
+    #imageio.mimwrite(os.path.join(model_path, name, "ours_{}".format(iteration), 'ours_video.mp4'), render_array, fps=30, quality=8)
+    
+    # render_path_spiral
+    # render_path_spherical
+    render_images = []
+    render_depths = [] 
+    #render_poses = render_path_spiral(views[:10], focal=1, N=100)
+    #render_poses = generate_spherical_sample_path(views[:1])
+    render_poses = generate_ellipse_path(views,n_frames=200)
+    for idx, pose in enumerate(tqdm(render_poses, desc="Rendering progress")):
+        view.world_view_transform = torch.tensor(getWorld2View2(pose[:3, :3].T, pose[:3, 3], view.trans, view.scale)).transpose(0, 1).cuda()
+        view.full_proj_transform = (view.world_view_transform.unsqueeze(0).bmm(view.projection_matrix.unsqueeze(0))).squeeze(0)
+        view.camera_center = view.world_view_transform.inverse()[3, :3]
 
         torch.cuda.synchronize(); t0 = time.time()
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
-        torch.cuda.synchronize(); t1 = time.time()
-        
-        t_list.append(t1-t0)
-
+        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, return_normal_depth=True)
         rendering = render_pkg["render"]
-        gt = view.original_image[0:3, :, :]
-        name_list.append('{0:05d}'.format(idx) + ".png")
+        depth = render_pkg["depth_expected"] * -1 
+        depth = (depth - depth.min())/(depth.max()-depth.min())
+        
+        render_images.append(rendering)
+        render_depths.append(depth)
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+    render_array = torch.stack(render_images, dim=0).permute(0, 2, 3, 1)
+    render_array = (render_array*255).clip(0, 255).cpu().numpy().astype(np.uint8)
+    depth_array = torch.stack(render_depths, dim=0).permute(0, 2, 3, 1).repeat(1,1,1,3)
+    depth_array = (depth_array*255).clip(0, 255).cpu().numpy().astype(np.uint8)
 
-    t = np.array(t_list[5:])
-    fps = 1.0 / t.mean()
-    print(f'Test FPS: \033[1;35m{fps:.5f}\033[0m')
+    video_name = os.path.join(video_path, 'ours_rgb.mp4')
+    gif_name = os.path.join(video_path, 'ours_rgb.gif')
+    gif_depth_name = os.path.join(video_path, 'ours_depth.gif')
 
-    with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
-            json.dump(per_view_dict, fp, indent=True)      
-     
+    imageio.mimwrite(video_name, render_array, fps=50)
+    imageio.mimsave(gif_name, render_array, fps=50)
+    imageio.mimsave(gif_depth_name, depth_array, fps=50)
+
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
@@ -98,5 +119,5 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
-
+    args.fewshot_num = -1
     render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
